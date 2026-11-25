@@ -1,0 +1,65 @@
+{
+  "project": {
+    "version": 1,
+    "id": "f3b848e4c62449a1bce8a1f0358ec775",
+    "name": "Paper Boat",
+    "character": "A handmade white paper sailboat with a small blue pencil stripe",
+    "environment": "A shallow puddle bordered by moss and small garden stones after rain",
+    "style": "Natural macro photography, warm daylight, gentle shallow depth of field",
+    "settings": {
+      "width": 640,
+      "height": 384,
+      "frames": 124,
+      "seed": "420030",
+      "speed_mode": "manual",
+      "transitions": [
+        [
+          3,
+          0.5
+        ],
+        [
+          8,
+          1
+        ]
+      ]
+    },
+    "delivery": {
+      "fps": 24
+    },
+    "scenes": [
+      {
+        "id": "749c0b92cca1416b9f1aa8b82534e763",
+        "title": "Into the water",
+        "transition": "cut",
+        "references": [],
+        "overrides": {},
+        "passes": [
+          {
+            "id": "761b4dc833e34f1f83c8c961a5c5289e",
+            "mode": "generate",
+            "prompt": "Track the paper sailboat from water level as it drifts past a tiny leaf. Ripples lap against the paper and distant birds sing.",
+            "overrides": {}
+          }
+        ]
+      },
+      {
+        "id": "e775649774d74f2492ce5bc1e2f19444",
+        "title": "Around the stone",
+        "transition": "continuous",
+        "references": [],
+        "overrides": {
+          "frames": 107
+        },
+        "passes": [
+          {
+            "id": "150332dfdad24a358d4ff5a192312281",
+            "mode": "generate",
+            "prompt": "Continuing the gentle tracking move, the sailboat rounds a smooth gray stone into a ribbon of sunlight. Keep quiet water and birdsong.",
+            "overrides": {}
+          }
+        ]
+      }
+    ]
+  },
+  "assets": {}
+}
