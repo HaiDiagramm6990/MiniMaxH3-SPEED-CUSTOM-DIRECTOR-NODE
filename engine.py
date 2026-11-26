@@ -1,6 +1,8 @@
 from functools import cache
+import gc
 import hashlib
 import json
+import logging
 from pathlib import Path
 import shutil
 import tempfile
@@ -19,7 +21,19 @@ from .live_preview import LivePreview
 from .media import concatenate, ffmpeg_path, finish_pass, read_frame, write_pass
 from .native import NativeH3, check_delivery, interrupt
 from .project import FPS, digest, parse_action, validate_project
-from .storage import SESSION, asset_path, cleanup, output_root, pass_complete, project_root, read_json, staging, write_json
+from .storage import SESSION, asset_metadata_path, asset_path, asset_visible, cleanup, output_root, pass_complete, project_root, read_json, staging, write_json
+
+
+def reclaim_memory():
+    try:
+        gc.collect()
+        comfy.model_management.soft_empty_cache()
+    except RuntimeError:
+        logging.getLogger(__name__).warning("Director could not release unused memory", exc_info=True)
+
+
+def pass_work(settings):
+    return settings["width"] * settings["height"] * settings["frames"] * settings["steps"]
 
 
 def source_digest():
@@ -93,9 +107,15 @@ def run_project(project_json, action_json, model, clip, video_vae, audio_vae, gr
     }
     native = None
     live = None
+    memory_used = False
     preview_requested = project["live_preview"]["enabled"]
 
     def status(phase, **values):
+        nonlocal memory_used
+        if phase in ("conditioning", "delivery"):
+            memory_used = True
+        if state.get("phase") != phase or "phase_started_at" not in state:
+            state["phase_started_at"] = time.time()
         state.update(values, phase=phase)
         write_json(state_path, state)
         server = PromptServer.instance
@@ -127,6 +147,9 @@ def run_project(project_json, action_json, model, clip, video_vae, audio_vae, gr
         else:
             selected = scenes
         state["total"] = sum(len(scene["passes"]) for scene in selected)
+        timing = state["eta"] = {"remaining_work": sum(pass_work(beat["settings"]) for scene in selected for beat in scene["passes"]),
+                                 "pass_work": 0, "seconds_per_work": None}
+        measured_work = measured_seconds = 0
         plans = {}
         asset_records = {}
 
@@ -135,7 +158,7 @@ def run_project(project_json, action_json, model, clip, video_vae, audio_vae, gr
                 return None
             if asset not in asset_records:
                 path = asset_path(asset)
-                if not path.is_file():
+                if not asset_visible(read_json(asset_metadata_path(asset), {}), project["id"]) or not path.is_file():
                     raise ValueError(f"Missing Director reference media ({asset})")
                 with path.open("rb") as source:
                     asset_records[asset] = (hashlib.file_digest(source, "sha256").hexdigest(), path)
@@ -252,11 +275,14 @@ def run_project(project_json, action_json, model, clip, video_vae, audio_vae, gr
                                    [asset_record(a)[0] for a in plan.get("audios", [])]])
                 key = digest(inputs)
                 target = cache_dir / key
+                work_units = pass_work(settings)
                 if pass_complete(target):
                     manifest = read_json(target / "manifest.json")
                     reused += 1
                     status("cached", **context)
                 else:
+                    pass_started = time.monotonic()
+                    timing.update(pass_work=work_units, pass_started_at=time.time())
                     if target.exists():
                         shutil.rmtree(target)
                     if live is None and preview_requested and server.client_id:
@@ -276,12 +302,21 @@ def run_project(project_json, action_json, model, clip, video_vae, audio_vae, gr
                     del av_references
                     if generation != "legacy":
                         stats["generation"] = generation
-                    with staging(cache_dir, target) as work:
-                        status("saving", **context)
-                        manifest = write_pass(work, image, audio, trim) | stats
-                        write_json(work / "manifest.json", manifest)
-                    del image, audio
+                    try:
+                        with staging(cache_dir, target) as work:
+                            status("saving", **context)
+                            manifest = write_pass(work, image, audio, trim) | stats
+                            write_json(work / "manifest.json", manifest)
+                    finally:
+                        del image, audio
+                    if project["auto_cleanup"]:
+                        reclaim_memory()
                     generated += 1
+                    measured_work += work_units
+                    measured_seconds += time.monotonic() - pass_started
+                    timing["seconds_per_work"] = measured_seconds / measured_work
+                timing["remaining_work"] -= work_units
+                timing["pass_work"] = 0
                 entry = manifest | {"token": key, "directory": target, "continuous": continuous}
                 if beat["mode"] == "replace":
                     active[-1] = entry
@@ -338,6 +373,8 @@ def run_project(project_json, action_json, model, clip, video_vae, audio_vae, gr
             live.close()
         if native is not None:
             native.close()
+        if project["auto_cleanup"] and memory_used:
+            reclaim_memory()
 
 
 def boundary(entry, side):

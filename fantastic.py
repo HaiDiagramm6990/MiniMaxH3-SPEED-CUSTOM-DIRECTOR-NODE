@@ -13,7 +13,7 @@ from .project import FPS, GENERATION_MODES, KEYFRAMES
 BUILDER = "MiniMaxH3PromptBuilder"
 FRONTEND_EXPORTS = ("MODES", "MODE_CAPACITY", "TASK_TYPES", "VISUAL_MARKERS", "AUDIO_MARKERS",
                     "OPTIONAL_SECTIONS", "defaultState", "normaliseState", "generate", "validate",
-                    "snapLength", "loadPrefs", "setNamePrefix")
+                    "snapLength", "loadPrefs", "setNamePrefix", "LANGS", "AUDIO_ROLES")
 
 
 def upstream():

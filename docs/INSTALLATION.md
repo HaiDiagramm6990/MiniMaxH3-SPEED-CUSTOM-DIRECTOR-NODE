@@ -30,6 +30,10 @@ The release was validated with ComfyUI **0.43.0** (`bb878b9ee`), frontend **1.57
 
    PyAV (`av`), PyTorch, NumPy, Pillow and aiohttp use the host’s versions. `imageio-ffmpeg` supplies the FFmpeg executable for delivery. Follow each dependency’s installation instructions for its optional extras. Preserve the working PyTorch/CUDA combination of your ComfyUI environment.
 
+## Update an existing Director
+
+For a Git installation, run `git pull --ff-only` in the existing Director directory. For a ZIP installation, update the files in the existing Director directory from the latest release package. Restart ComfyUI and refresh the browser. Projects and render checkpoints live in ComfyUI’s user directory. [Releases](https://github.com/HaiDiagramm6990/MiniMaxH3-SPEED-CUSTOM-DIRECTOR-NODE/releases).
+
 ## Install the H3 models
 
 Use the [official native ComfyUI H3 guide](https://github.com/Comfy-Org/docs/blob/main/tutorials/video/minimax/minimax-h3-native.mdx) and [Comfy-Org model files](https://huggingface.co/Comfy-Org/MiniMax-H3). For external model folders, use ComfyUI’s `extra_model_paths.yaml` and select the resulting entries in the workflow. Check the [MiniMax H3 model terms](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE) and obtain the required local-use license where applicable.

@@ -84,6 +84,16 @@ class TimelineTests(unittest.TestCase):
         del raw["live_preview"]
         self.assertFalse(project.validate_project(raw)["live_preview"]["enabled"])
 
+    def test_memory_cleanup_defaults_on_and_can_be_disabled(self):
+        raw = project.default_project()
+        del raw["auto_cleanup"]
+        self.assertTrue(project.validate_project(raw)["auto_cleanup"])
+        raw["auto_cleanup"] = False
+        self.assertFalse(project.validate_project(raw)["auto_cleanup"])
+        raw["auto_cleanup"] = "false"
+        with self.assertRaisesRegex(ValueError, "Auto memory cleanup"):
+            project.validate_project(raw)
+
     def test_preview_settings_are_bounded(self):
         raw = project.default_project()
         raw["live_preview"] = {"enabled": True, "resolution": 192, "frames": 6, "fps": 12}

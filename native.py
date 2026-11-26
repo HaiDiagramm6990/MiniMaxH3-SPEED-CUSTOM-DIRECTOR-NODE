@@ -162,8 +162,7 @@ class NativeH3:
         if beat["cfg"] == 1:
             guider = BasicGuider.execute(model, positive).args[0]
         else:
-            negative_conditioning, _ = encode(negative)
-            guider = CFGGuider.execute(model, positive, negative_conditioning, beat["cfg"]).args[0]
+            guider = CFGGuider.execute(model, positive, encode(negative)[0], beat["cfg"]).args[0]
         noise = RandomNoise.execute(int(beat["seed"])).args[0]
         interrupt()
         notify("sampling")
@@ -174,7 +173,7 @@ class NativeH3:
         output, denoised = speed(noise, guider, sigmas, latent, config, sampler=sampler,
                                  model_type=cls.MODEL_TYPE, disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED,
                                  preview_callback=progress)
-        del denoised, guider, latent
+        del denoised, guider, latent, positive
         if gpu:
             torch.cuda.synchronize(device)
         sampling_seconds = time.monotonic() - sampling_start

@@ -57,36 +57,51 @@ export function materializePrompt(compiler, project, scene, pass) {
     return compiled;
 }
 
-export function referenceSlots(compiler, scene, pass, assets, linkedFirst) {
+export function referenceSlots(compiler, scene, pass, assets, linkedFirst, previousScene) {
     const mode = generationOf(scene, pass);
     const media = mediaFor(scene, pass);
     const slots = [];
-    const add = (kind, source) => {
-        const idx = slots.filter(slot => slot.kind === kind).length + 1;
-        slots.push({ kind, idx, tag: `<${kind} ${idx}>`, source, slotName: source });
+    const lookup = new Map(assets.map(asset => [asset.id, asset]));
+    const order = new Map();
+    const add = (kind, id, fallback, identity = id, number, role) => {
+        const idx = number ?? slots.filter(slot => slot.kind === kind).length + 1;
+        const asset = lookup.get(id);
+        const source = asset?.name ?? fallback ?? id;
+        const key = `${kind}:${identity}`;
+        const occurrence = (order.get(key) ?? 0) + 1;
+        order.set(key, occurrence);
+        slots.push({ kind, idx, tag: `<${kind} ${idx}>`, source, slotName: source, asset, id, role,
+            identity: `${key}:${occurrence}`, missing: Boolean(id && !asset) });
     };
-    const name = id => assets.find(asset => asset.id === id)?.name ?? id;
+    const tail = () => add("Picture", null, "Previous scene tail", `tail:${previousScene ?? "previous"}`);
+    if (mode === "legacy") {
+        if (pass.mode === "generate" && scene.transition === "reference" && scene.previous_reference) tail();
+        for (const id of scene.references ?? []) add("Picture", id);
+        return slots;
+    }
+    if (!compiler) return slots;
     if (mode !== "REF") {
-        for (const role of Object.values(compiler.MODE_CAPACITY[mode].roles)) {
+        for (const [label, role] of Object.entries(compiler.MODE_CAPACITY[mode].roles)) {
             const isFirst = role === "first frame";
             const asset = isFirst ? media.first_frame : media.last_frame;
-            if (asset || (isFirst ? linkedFirst || pass.mode !== "generate" || scene.transition === "continuous" : pass.mode === "replace")) {
-                add("Picture", asset ? name(asset) : role);
-            }
+            const source = isFirst ? firstFrameSource(scene, pass, linkedFirst)?.kind : pass.mode === "replace" ? "pass-tail" : "missing";
+            const prior = scene.passes?.[scene.passes.findIndex(beat => beat.id === pass.id) - 1];
+            if (asset || (source && source !== "missing")) add("Picture", asset, role,
+                asset ?? `${source}:${source === "scene-tail" ? previousScene : prior?.id}`, Number(label.split(" ")[1]), role);
         }
         return slots;
     }
-    if (carriesReference(scene, pass)) add("Picture", "Previous scene tail");
-    for (const asset of media.references ?? []) add("Picture", name(asset));
-    const hasSound = entry => assets.some(asset => asset.id === entry.asset && asset.has_audio);
+    if (carriesReference(scene, pass)) tail();
+    for (const asset of media.references ?? []) add("Picture", asset);
+    const hasSound = entry => lookup.get(entry.asset)?.has_audio;
     for (const entry of media.videos ?? []) {
-        if (entry.audio_mode === "paired" && hasSound(entry)) add("Audio", name(entry.asset));
-        add("Video", name(entry.asset));
+        if ((entry.audio_mode ?? "paired") === "paired" && hasSound(entry)) add("Audio", entry.asset, null, `soundtrack:${entry.asset}`);
+        add("Video", entry.asset);
     }
     for (const entry of media.videos ?? []) {
-        if (entry.audio_mode === "standalone" && hasSound(entry)) add("Audio", name(entry.asset));
+        if (entry.audio_mode === "standalone" && hasSound(entry)) add("Audio", entry.asset, null, `soundtrack:${entry.asset}`);
     }
-    for (const asset of media.audios ?? []) add("Audio", name(asset));
+    for (const asset of media.audios ?? []) add("Audio", asset);
     return slots;
 }
 

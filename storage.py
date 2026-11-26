@@ -29,6 +29,15 @@ def asset_path(asset):
     return Path(folder_paths.get_input_directory()) / "h3_speed_director" / asset
 
 
+def asset_metadata_path(asset):
+    return root() / "assets" / f"{asset}.json"
+
+
+def asset_visible(metadata, project_id):
+    owner = metadata.get("project_id")
+    return owner is None or owner == project_id
+
+
 def output_root(project_id):
     return Path(folder_paths.get_output_directory()) / "H3-SpeedDirector" / project_id
 

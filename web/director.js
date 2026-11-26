@@ -2,10 +2,14 @@ import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { assetIds, carriesReference, firstFrameSource, generationOf, materializePrompt, mediaFor, referenceSlots, remapAssets, retainsOverlap, settingsFor } from "./fantastic.js";
 import { PreviewMonitor } from "./live-preview.js";
+import { estimateRenderSeconds, ProjectHistory } from "./editor-state.js";
+import { mountPrompt } from "./prompt-editor.js";
+import { promptFields, rebaseReferences, speakerIds, subjectSlots } from "./prompt-syntax.js";
 
 const PREFIX = "/h3-speed-director";
 const NODE = "H3SpeedDirector";
 const APPROVED_VIDEO = "H3SpeedDirectorRenderedVideo";
+const STILL_TYPES = "image/png,image/jpeg,image/webp";
 const $ = (root, selector) => root.querySelector(selector);
 const uuid = () => crypto.randomUUID().replaceAll("-", "");
 const el = (tag, className, label) => {
@@ -45,6 +49,7 @@ function withDefaults(project, options) {
         ...project, settings: { ...options.project.settings, ...project.settings },
         delivery: { ...options.project.delivery, ...project.delivery },
         ...(options.live_preview ? { live_preview: { ...options.project.live_preview, ...project.live_preview } } : {}),
+        ...(typeof options.project.auto_cleanup === "boolean" ? { auto_cleanup: project.auto_cleanup ?? options.project.auto_cleanup } : {}),
         scenes: project.scenes.map(scene => ({
             transition: "cut", references: [], overrides: {}, ...scene,
             passes: scene.passes.map((pass, index) => ({ mode: index ? "extend" : "generate", overrides: {}, ...pass })),
@@ -85,6 +90,26 @@ function button(text, handler, className = "") {
     target.type = "button";
     target.addEventListener("click", handler);
     return target;
+}
+
+function bindFileDrop(zone, receive) {
+    zone.ondragover = event => {
+        if (!event.dataTransfer.types.includes("Files")) return;
+        event.preventDefault();
+        event.stopPropagation();
+        event.dataTransfer.dropEffect = "copy";
+        zone.classList.add("hsd-drop");
+    };
+    zone.ondragleave = event => {
+        if (!event?.relatedTarget || !zone.contains(event.relatedTarget)) zone.classList.remove("hsd-drop");
+    };
+    zone.ondrop = event => {
+        if (!event.dataTransfer.types.includes("Files")) return;
+        event.preventDefault();
+        event.stopPropagation();
+        zone.classList.remove("hsd-drop");
+        receive(Array.from(event.dataTransfer.files));
+    };
 }
 
 function inputField(container, label, type, value, change, step) {
@@ -145,6 +170,11 @@ class Editor {
         this.widget = widget;
         this.options = options;
         this.assets = [];
+        this.history = new ProjectHistory();
+        this.uploadScope = "project";
+        this.libraryFilter = "available";
+        this.libraryPreview = null;
+        this.firstFrameUploads = new WeakSet();
         this.status = {};
         this.active = project.scenes[0].id;
         this.pass = project.scenes[0].passes[0].id;
@@ -190,13 +220,18 @@ class Editor {
                 </section>
             </main>
             <footer class="hsd-footer">
-                <div class="hsd-render-info"><span data-status role="status"></span><progress max="1" value="0"></progress></div>
+                <div class="hsd-render-info"><span data-status role="status"></span><progress max="1" value="0"></progress><output data-render-eta aria-live="off" hidden></output></div>
                 <div class="hsd-actions" data-render-actions></div>
             </footer>`;
         const toolbar = $(this.dialog, "[data-toolbar]");
+        this.undoButton = button("Undo", () => this.applyHistory("undo"));
+        this.redoEditButton = button("Redo", () => this.applyHistory("redo"));
+        this.undoButton.title = "Ctrl+Z";
+        this.redoEditButton.title = "Ctrl+Y";
         toolbar.append(button("New", () => this.perform(() => this.newProject())),
             button("Open", () => this.perform(() => this.openProject())),
             button("Save", () => this.perform(() => this.saveProject())),
+            this.undoButton, this.redoEditButton,
             button("Import JSON", () => this.chooseImport()),
             button("Export JSON", () => this.perform(() => this.exportProject())),
             button("Close", () => this.dialog.close(), "hsd-close"));
@@ -205,7 +240,9 @@ class Editor {
             button("Move left", () => this.move(-1)), button("Move right", () => this.move(1)),
             button("Delete", () => this.removeScene()));
         const tabs = $(this.dialog, "[data-tabs]");
-        for (const [id, label] of [["scene", "Scene"], ["project", "Project settings"], ["assets", "References"]]) {
+        const editorTabs = [["scene", "Scene"], ["project", "Project settings"], ["assets", "References"]];
+        if (options.reference_scopes) editorTabs.push(["library", "Reference library"]);
+        for (const [id, label] of editorTabs) {
             const tab = button(label, () => { this.tab = id; this.renderInspector(); });
             tab.dataset.tab = id;
             tabs.append(tab);
@@ -224,20 +261,36 @@ class Editor {
             if (detail?.project === this.project.id) this.monitor.receive(detail);
         };
         this.onDirectorProgress = ({ detail }) => {
-            if (detail?.project === this.project.id && ["complete", "interrupted", "failed"].includes(detail.phase)) {
+            if (detail?.project === this.project.id && ["sampling", "complete", "interrupted", "failed"].includes(detail.phase)) {
                 this.refresh().catch(() => {});
             }
         };
         this.onStep = event => {
             const data = event.detail;
             if (data?.prompt_id === this.status.prompt_id && this.status.phase === "sampling" && data.max) {
-                this.fractional = data.value / data.max;
+                this.fractional = Math.min(1, data.value / data.max);
+                this.etaProgress = { step: data.value, fraction: this.fractional, at: Date.now() / 1000 };
                 this.renderProgress();
             }
         };
         api.addEventListener("progress", this.onStep);
         api.addEventListener("h3-speed-director.live", this.onLive);
         api.addEventListener("h3-speed-director.progress", this.onDirectorProgress);
+        this.dialog.addEventListener("input", event => {
+            if (!event.target.matches("textarea, input[type=text]")) return;
+            this.historyGroup = event.target;
+            queueMicrotask(() => { this.historyGroup = null; });
+        }, true);
+        this.historyKey = event => {
+            if (!(event.ctrlKey || event.metaKey) || event.altKey || event.isComposing) return;
+            const key = event.key.toLowerCase();
+            if (key !== "z" && key !== "y") return;
+            if (Array.from(document.querySelectorAll("dialog.hsd[open]")).at(-1) !== this.dialog) return;
+            event.preventDefault();
+            event.stopPropagation();
+            this.applyHistory(key === "y" || event.shiftKey ? "redo" : "undo");
+        };
+        document.addEventListener("keydown", this.historyKey, true);
         this.dialog.addEventListener("close", () => this.dispose());
         document.body.append(this.dialog);
         this.commit();
@@ -251,11 +304,13 @@ class Editor {
     get activePass() { return this.scene.passes.find(pass => pass.id === this.pass) ?? this.scene.passes[0]; }
 
     dispose() {
+        this.dialog.querySelectorAll(".hsd-prompt-entry").forEach(editor => editor.disposePrompt());
         clearInterval(this.timer);
         this.monitor.clear();
         api.removeEventListener("progress", this.onStep);
         api.removeEventListener("h3-speed-director.live", this.onLive);
         api.removeEventListener("h3-speed-director.progress", this.onDirectorProgress);
+        document.removeEventListener("keydown", this.historyKey, true);
         this.dialog.remove();
         delete this.node.h3Editor;
     }
@@ -278,7 +333,21 @@ class Editor {
             }
         }
         this.widget.value = JSON.stringify(this.project);
+        this.history.record(this.widget.value, this.historyGroup);
+        this.undoButton.disabled = !this.history.undo.length;
+        this.redoEditButton.disabled = !this.history.redo.length;
         this.node.graph?.setDirtyCanvas(true, true);
+    }
+
+    applyHistory(direction) {
+        const snapshot = this.history.move(direction);
+        if (!snapshot) return;
+        this.project = JSON.parse(snapshot);
+        this.active = (this.scene ?? this.project.scenes[0]).id;
+        this.pass = this.activePass.id;
+        this.commit();
+        this.renderLiveSettings();
+        this.render();
     }
 
     mutate(refresh = false) {
@@ -316,8 +385,10 @@ class Editor {
     removeScene() {
         if (this.project.scenes.length < 2) return this.notice("A project needs one scene.");
         const index = this.project.scenes.indexOf(this.scene);
-        this.project.scenes.splice(index, 1);
-        this.normalizeOpening();
+        this.editReferenceOrder(() => {
+            this.project.scenes.splice(index, 1);
+            this.normalizeOpening();
+        });
         this.commit();
         this.select(this.project.scenes[Math.min(index, this.project.scenes.length - 1)].id);
     }
@@ -339,9 +410,11 @@ class Editor {
     reorder(id, to) {
         const from = this.project.scenes.findIndex(scene => scene.id === id);
         if (from < 0 || to < 0 || to >= this.project.scenes.length || from === to) return;
-        const [scene] = this.project.scenes.splice(from, 1);
-        this.project.scenes.splice(to, 0, scene);
-        this.normalizeOpening();
+        this.editReferenceOrder(() => {
+            const [scene] = this.project.scenes.splice(from, 1);
+            this.project.scenes.splice(to, 0, scene);
+            this.normalizeOpening();
+        });
         this.commit();
         this.select(id);
     }
@@ -444,11 +517,178 @@ class Editor {
         this.dialog.querySelectorAll("[data-tab]").forEach(tab => tab.setAttribute("aria-pressed", String(tab.dataset.tab === this.tab)));
         const inspector = $(this.dialog, "[data-inspector]");
         const scroll = inspector.scrollTop;
+        const focused = document.activeElement;
+        const prompts = [...inspector.querySelectorAll(".hsd-prompt-entry textarea")];
+        const index = prompts.indexOf(focused);
+        const previous = index >= 0 ? [focused.labels[0]?.textContent, focused.selectionStart, focused.selectionEnd] : null;
+        const selectedPass = `${this.project.id}/${this.active}/${this.pass}`;
+        inspector.querySelectorAll(".hsd-prompt-entry").forEach(editor => editor.disposePrompt());
         inspector.replaceChildren();
         if (this.tab === "project") this.projectInspector(inspector);
         else if (this.tab === "assets") this.assetInspector(inspector);
+        else if (this.tab === "library") this.libraryInspector(inspector);
         else this.sceneInspector(inspector);
+        if (previous && inspector.dataset.promptPass === selectedPass) {
+            const next = [...inspector.querySelectorAll(".hsd-prompt-entry textarea")];
+            const field = next[index]?.labels[0]?.textContent === previous[0] ? next[index] : next.find(input => input.labels[0]?.textContent === previous[0]);
+            if (field) {
+                field.focus({ preventScroll: true });
+                field.setSelectionRange(previous[1], previous[2]);
+            }
+        }
+        inspector.dataset.promptPass = selectedPass;
         inspector.scrollTop = scroll;
+    }
+
+    slotsFor(scene, pass, assets = this.assets) {
+        const index = this.project.scenes.indexOf(scene);
+        const linked = index === 0 && scene.passes[0].id === pass.id &&
+            this.node.inputs?.some(input => input.name === "first_frame" && input.link != null);
+        return referenceSlots(this.options.compiler, scene, pass, assets, linked, this.project.scenes[index - 1]?.id);
+    }
+
+    editReferenceOrder(change) {
+        const before = new Map();
+        for (const scene of this.project.scenes) for (const pass of scene.passes) {
+            before.set(pass, this.slotsFor(scene, pass));
+        }
+        change();
+        for (const scene of this.project.scenes) for (const pass of scene.passes) {
+            const old = before.get(pass);
+            if (!old?.length) continue;
+            const next = this.slotsFor(scene, pass);
+            if (old.length === next.length && old.every((slot, i) => slot.identity === next[i].identity && slot.tag === next[i].tag)) continue;
+            for (const [owner, key] of promptFields(pass, generationOf(scene, pass))) {
+                if (owner[key]) owner[key] = rebaseReferences(owner[key], old, next);
+            }
+        }
+    }
+
+    referenceSuggestions(scene, pass) {
+        const mode = generationOf(scene, pass);
+        const capacity = this.options.compiler?.MODE_CAPACITY[mode];
+        if (!capacity && mode !== "legacy") return [];
+        const slots = this.slotsFor(scene, pass);
+        const assigned = new Set(slots.map(slot => slot.id));
+        const count = kind => slots.filter(slot => slot.kind === kind).length;
+        const media = mediaFor(scene, pass);
+        const results = [];
+        for (const asset of this.assets) {
+            const kind = { image: "Picture", video: "Video", audio: "Audio" }[asset.kind ?? "image"];
+            const append = (field, value, tag) => results.push({ tag, kind, asset, source: asset.name, url: this.assetUrl(asset.id),
+                scope: asset.project_id ? "This project" : "All projects", assign: { field, value } });
+            if (mode !== "legacy" && mode !== "REF") {
+                if (kind !== "Picture") continue;
+                for (const [label, role] of Object.entries(capacity.roles)) {
+                    const tag = `<${label}>`;
+                    if (!slots.some(slot => slot.tag === tag && !slot.missing)) append(role.replace(" ", "_"), asset.id, tag);
+                }
+                continue;
+            }
+            if (assigned.has(asset.id)) continue;
+            if (mode === "legacy" && (kind !== "Picture" || count("Picture") >= 9)) continue;
+            if (mode === "REF" && (slots.length >= capacity.total || count(kind) >= capacity[kind])) continue;
+            const tag = `<${kind} ${count(kind) + 1}>`;
+            if (kind === "Picture") append("references", [...(media.references ?? []), asset.id], tag);
+            if (kind === "Video") {
+                const paired = asset.has_audio && slots.length < capacity.total - 1 && count("Audio") < capacity.Audio;
+                append("videos", [...(media.videos ?? []), { asset: asset.id, audio_mode: paired ? "paired" : "off" }], tag);
+            }
+            if (kind === "Audio") append("audios", [...(media.audios ?? []), asset.id], tag);
+        }
+        return results;
+    }
+
+    promptEditor(mount, scene, pass, owner, key, label, { update = () => this.commit(), narrative = false, compact = false } = {}) {
+        const compiler = this.options.compiler;
+        const isRef = generationOf(scene, pass) === "REF";
+        const audioBehaviors = isRef ? compiler.AUDIO_MARKERS.filter(marker => marker.endsWith("_copy")) : [];
+        const related = () => this.dialog.querySelectorAll(".hsd-prompt-entry").forEach(editor => editor.refreshPrompt());
+        const audioRule = (tag, behavior) => {
+            const existing = pass.builder.ref.retention.find(entry => entry.label === tag && !entry.off);
+            const currentNote = existing?.marker === behavior ? existing.note : "";
+            const source = compiler.AUDIO_ROLES.find(role => role.id === "fullcopy");
+            const number = { n: Number(tag.match(/\d+/)[0]) };
+            const rules = {
+                fully_copy: [source.text(number), source.note(number)],
+                partially_copy: [`${tag} supplies the dialogue audio reused for this line.`, "Reuse only the selected spoken audio. Keep the other sounds in the target scene."],
+                reference: [`${tag} is the voice and delivery reference for this dialogue.`, "Use its timbre and delivery as guidance."],
+            };
+            const [definition, note] = rules[behavior];
+            return { definition, note: currentNote || note, changesRule: Boolean(existing && existing.marker !== behavior) };
+        };
+        const context = {
+            scrollContainer: $(this.dialog, "[data-inspector]"),
+            read: () => owner[key] ?? "",
+            frames: () => snapFrames(settingsFor(this.project, scene, pass).frames),
+            languages: compiler?.LANGS ?? [],
+            audioBehaviors,
+            audioRule,
+            slots: () => {
+                const slots = this.slotsFor(scene, pass);
+                const items = isRef ? [...subjectSlots(pass, slots), ...slots] : slots;
+                return items.map(slot => ({ ...slot,
+                    url: slot.asset ? this.assetUrl(slot.id) : this.promptFrameUrl(scene, pass, slot) }));
+            },
+            suggestions: () => this.referenceSuggestions(scene, pass),
+            speakers: () => {
+                const registry = { ...this.project.speakers };
+                for (const scene of this.project.scenes) for (const pass of scene.passes) {
+                    for (const [owner, key] of promptFields(pass, generationOf(scene, pass))) {
+                        for (const id of speakerIds(owner[key] ?? "")) registry[id] ??= "";
+                    }
+                }
+                return Object.entries(registry).sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true }));
+            },
+            assign: (item, value, { start, end }) => {
+                let marker = "\uE000";
+                while (value.includes(marker)) marker += "\uE001";
+                owner[key] = value.slice(0, start) + marker + value.slice(end);
+                this.editReferenceOrder(() => {
+                    const target = generationOf(scene, pass) === "legacy" ? scene : (pass.media ??= {});
+                    target[item.assign.field] = item.assign.value;
+                });
+                return { value: owner[key].replace(marker, item.tag), at: owner[key].indexOf(marker) + item.tag.length };
+            },
+            write: (value, extra) => {
+                owner[key] = value;
+                if (extra?.speakers) this.project.speakers = extra.speakers;
+                if (isRef && extra?.audio) {
+                    const { audio, behavior } = extra;
+                    const state = pass.builder;
+                    const rule = audioRule(audio, behavior);
+                    const { subjectDefs, retention, summaryTypes } = state.ref;
+                    const task = behavior === "reference" ? "audio reference" : "audio reuse";
+                    if (!summaryTypes.includes(task)) summaryTypes.push(task);
+                    if (!subjectDefs.some(entry => entry.text?.startsWith(audio) && !entry.off)) {
+                        subjectDefs.push({ text: rule.definition, name: "", voice: "" });
+                    }
+                    const row = retention.find(entry => entry.label === audio && !entry.off);
+                    if (row) { row.marker = behavior; row.note = rule.note; }
+                    else retention.push({ label: audio, marker: behavior, context: "", note: rule.note });
+                    if (state.off) state.off.subject_definitions = state.off.retention_analysis = false;
+                    // Refresh the structured rows after the prompt editor places the caret.
+                    queueMicrotask(() => this.renderInspector());
+                }
+                update();
+                related();
+            },
+        };
+        return mountPrompt(mount, label, context, { narrative, compact });
+    }
+
+    promptFrameUrl(scene, pass, slot) {
+        if (slot.role === "first frame") return $(this.dialog, "[data-first-frame-preview] img")?.src;
+        if (!this.options.boundary_thumbnails) return undefined;
+        if (slot.role === "last frame" && pass.mode === "replace") {
+            const previous = scene.passes[scene.passes.indexOf(pass) - 1];
+            const token = this.status.scenes?.[scene.id]?.takes?.[previous?.id];
+            return token ? this.media(token, "tail") : undefined;
+        }
+        if (slot.source !== "Previous scene tail") return undefined;
+        const previous = this.project.scenes[this.project.scenes.indexOf(scene) - 1];
+        const token = this.status.scenes?.[previous?.id]?.passes?.at(-1)?.token;
+        return token ? this.media(token, "tail") : undefined;
     }
 
     projectInspector(inspector) {
@@ -458,6 +698,13 @@ class Editor {
             inputField(global, label, "textarea", this.project[key], value => { this.project[key] = value; this.commit(); });
         }
         inspector.append(global, el("h3", "", "Generation defaults"));
+        if (typeof this.options.project.auto_cleanup === "boolean") {
+            inputField(inspector, "Auto memory cleanup", "checkbox", this.project.auto_cleanup, value => {
+                this.project.auto_cleanup = value;
+                this.commit();
+            });
+            inspector.append(el("p", "hsd-note", "Release unused VRAM and reclaimable RAM after each generated pass and when the job ends."));
+        }
         const grid = el("div", "hsd-grid");
         this.controls(grid, this.project.settings, baseFields);
         inspector.append(grid, el("h3", "", "Delivery"));
@@ -482,15 +729,17 @@ class Editor {
         const choices = [["cut", "Hard cut"], ...(continuation ? [["continuous", "Continue previous shot"]] : []),
             ["reference", "Reference transition"]];
         inputField(overview, "Transition into scene", choices, scene.transition, value => {
-            scene.transition = value;
-            if (value === "continuous" && generationOf(scene, scene.passes[0]) === "legacy") scene.first_frame = null;
-            if (value !== "reference") scene.previous_reference = false;
+            this.editReferenceOrder(() => {
+                scene.transition = value;
+                if (value === "continuous" && generationOf(scene, scene.passes[0]) === "legacy") scene.first_frame = null;
+                if (value !== "reference") scene.previous_reference = false;
+            });
             this.mutate(true);
         });
         this.passDuration(overview, "Scene default per pass (seconds)", scene.overrides, this.project.settings.frames, "Use project default");
         if (scene.transition === "reference" && continuation) {
             inputField(overview, "Use previous tail as <Picture 1>", "checkbox", scene.previous_reference,
-                value => { scene.previous_reference = value; this.mutate(true); });
+                value => { this.editReferenceOrder(() => { scene.previous_reference = value; }); this.mutate(true); });
         }
         inspector.append(overview);
         this.addFirstFramePreview(inspector);
@@ -533,16 +782,16 @@ class Editor {
         if (scene.passes[0] !== pass) {
             const row = el("div", "hsd-grid");
             inputField(row, "Pass role", [["extend", "Extend the shot"], ["replace", "Replace preceding pass"]], pass.mode,
-                value => { pass.mode = value; this.mutate(true); });
+                value => { this.editReferenceOrder(() => { pass.mode = value; }); this.mutate(true); });
             row.append(button("Delete pass", () => {
-                scene.passes.splice(scene.passes.indexOf(pass), 1);
+                this.editReferenceOrder(() => { scene.passes.splice(scene.passes.indexOf(pass), 1); });
                 this.pass = scene.passes[0].id;
                 this.mutate(true);
             }));
             inspector.append(row);
         }
         if (generationOf(scene, pass) === "legacy") {
-            inputField(inspector, "Pass prompt", "textarea", pass.prompt, value => { pass.prompt = value; this.commit(); });
+            this.promptEditor(inspector, scene, pass, pass, "prompt", "Pass prompt", { narrative: true });
             if (this.options.fantasticError) inspector.append(el("p", "hsd-note", this.options.fantasticError));
         } else if (this.options.compiler) {
             this.structuredPrompt(inspector, scene, pass);
@@ -550,7 +799,7 @@ class Editor {
             inspector.append(el("p", "hsd-error", this.options.fantasticError || "Fantastic PromptBuilder is unavailable."),
                 el("pre", "hsd-built-prompt", pass.compiled_prompt || ""));
         }
-        inputField(inspector, "Negative prompt · CFG above 1", "textarea", pass.negative, value => { pass.negative = value; this.commit(); });
+        this.promptEditor(inspector, scene, pass, pass, "negative", "Negative prompt · CFG above 1");
         this.overrides(inspector, pass.overrides, options);
     }
 
@@ -573,12 +822,12 @@ class Editor {
         if (!source) return;
 
         let name = "No first frame selected";
-        let description = "Choose an image in References.";
+        let description = "Drop an image here to set this pass’s first frame.";
         let url = null;
         if (source.kind === "asset") {
             name = this.assets.find(asset => asset.id === source.asset)?.name ?? "Selected library image";
             description = source.override ? "This pass’s image" : "Scene default";
-            url = api.apiURL(PREFIX + "/assets/" + source.asset);
+            url = this.assetUrl(source.asset);
         } else if (source.kind === "graph") {
             const upstream = this.node.getInputNode(firstSlot);
             name = upstream?.title || "Connected first frame";
@@ -624,11 +873,27 @@ class Editor {
             image.onerror = () => { image.hidden = true; detail.textContent = "Image preview unavailable."; };
             card.prepend(image);
         }
-        if (this.tab === "scene") text.append(button("Manage first frame", () => {
-            this.assetScope = "pass";
-            this.tab = "assets";
-            this.renderInspector();
-        }));
+        if (this.tab === "scene") {
+            const actions = el("div", "hsd-first-frame-actions");
+            if (["I2VA", "FL2VA"].includes(generationOf(scene, pass))) {
+                const upload = el("input", "hsd-file");
+                upload.type = "file";
+                upload.accept = STILL_TYPES;
+                const receive = files => this.assignFirstFrame(files);
+                upload.onchange = () => {
+                    receive(Array.from(upload.files));
+                    upload.value = "";
+                };
+                bindFileDrop(card, receive);
+                actions.append(button("Drop image or browse", () => upload.click(), "hsd-image-drop"), upload);
+            }
+            actions.append(button("Manage first frame", () => {
+                this.assetScope = "pass";
+                this.tab = "assets";
+                this.renderInspector();
+            }));
+            text.append(actions);
+        }
     }
 
     generationChoices() {
@@ -646,19 +911,22 @@ class Editor {
         const output = el("pre", "hsd-built-prompt");
         const issues = el("ul", "hsd-prompt-issues");
         const timing = el("p", "hsd-note");
-        const graphImage = this.project.scenes[0] === scene && scene.passes[0] === pass &&
-            this.node.inputs?.some(input => input.name === "first_frame" && input.link != null);
         const update = () => {
             const generated = materializePrompt(composer, this.project, scene, pass);
             this.commit();
             output.textContent = pass.compiled_prompt;
             timing.textContent = `${Math.round(generated.duration * 24)} frames at 24 fps`;
-            const slots = referenceSlots(composer, scene, pass, this.assets, graphImage);
+            const slots = this.slotsFor(scene, pass).filter(slot => !slot.missing);
             issues.replaceChildren(...composer.validate(generated, slots).map(issue =>
                 el("li", issue.level === "error" ? "hsd-error" : "", issue.msg)));
         };
-        const field = (mount, owner, key, label, type = "textarea") =>
-            inputField(mount, label, type, owner[key], value => { owner[key] = value; update(); });
+        const field = (mount, owner, key, label, type = "textarea") => {
+            if (type === "textarea" || type === "prompt-line") {
+                return this.promptEditor(mount, scene, pass, owner, key, label,
+                    { update, narrative: ["detail", "imd"].includes(key), compact: type === "prompt-line" });
+            }
+            return inputField(mount, label, type, owner[key], value => { owner[key] = value; update(); });
+        };
         const optional = (mount, name, label) => inputField(mount, `Include ${label}`, "checkbox", !state.off?.[name], value => {
             (state.off ??= {})[name] = !value;
             update();
@@ -673,7 +941,7 @@ class Editor {
             });
             section.append(types);
             field(section, ref, "summaryText", "Summary");
-            field(section, ref, "styleLine", "Style opening", "text");
+            field(section, ref, "styleLine", "Style opening", "prompt-line");
             field(section, ref, "detail", "Detailed description");
             for (const [key, label, heading] of [["subjectDefs", "subject definitions", "Subject definitions"], ["retention", "retention analysis", "Retention analysis"]]) {
                 const details = el("details", "hsd-details");
@@ -685,10 +953,10 @@ class Editor {
                     if (key === "subjectDefs") {
                         field(row, entry, "text", "Definition");
                         field(row, entry, "name", "Subject name", "text");
-                        field(row, entry, "voice", "Voice description", "text");
+                        field(row, entry, "voice", "Voice description", "prompt-line");
                     } else {
-                        field(row, entry, "label", "Reference tag", "text");
-                        field(row, entry, "context", "Context", "text");
+                        field(row, entry, "label", "Reference tag", "prompt-line");
+                        field(row, entry, "context", "Context", "prompt-line");
                         field(row, entry, "marker", "Retention", [...new Set([...composer.VISUAL_MARKERS, ...composer.AUDIO_MARKERS])]);
                         field(row, entry, "note", "Retention note");
                     }
@@ -726,6 +994,10 @@ class Editor {
         const compiler = this.options.compiler;
         const capacity = compiler?.MODE_CAPACITY[generation];
         inspector.append(el("h3", "", `References for ${scene.title}`));
+        if (this.options.reference_scopes) inspector.append(button("Open reference library", () => {
+            this.tab = "library";
+            this.renderInspector();
+        }));
         if (generation === "T2VA") {
             inspector.append(el("p", "hsd-note", "T2VA uses the prompt without reference media."));
             return;
@@ -738,44 +1010,23 @@ class Editor {
             inputField(inspector, "Apply reference changes to", [["scene", "Scene defaults"], ["pass", "This pass"]], this.assetScope,
                 value => { this.assetScope = value; this.renderInspector(); });
             if (this.assetScope === "pass" && pass.media) {
-                inspector.append(button("Use scene media defaults", () => { delete pass.media; this.mutate(true); }));
+                inspector.append(button("Use scene media defaults", () => {
+                    this.editReferenceOrder(() => { delete pass.media; });
+                    this.mutate(true);
+                }));
             }
         }
         const perPass = generation !== "legacy" && this.assetScope === "pass";
         const current = perPass ? mediaFor(scene, pass) : scene;
         const updateMedia = (name, value) => {
-            if (perPass) (pass.media ??= {})[name] = value;
-            else scene[name] = value;
+            this.editReferenceOrder(() => {
+                if (perPass) (pass.media ??= {})[name] = value;
+                else scene[name] = value;
+            });
             this.mutate(true);
         };
 
-        const upload = el("input", "hsd-file");
-        upload.type = "file";
-        upload.accept = "image/png,image/jpeg,image/webp" + (generation === "REF" ? ",.mp4,.mov,.mkv,.webm,.wav,.mp3,.flac,.m4a,.ogg" : "");
-        upload.multiple = true;
-        upload.onchange = () => {
-            const files = Array.from(upload.files);
-            upload.value = "";
-            this.addImages(files);
-        };
-        const dropZone = button(generation === "REF" ? "Drop images, video or audio here or browse" : "Drop images here or browse",
-            () => upload.click(), "hsd-image-drop");
-        dropZone.ondragover = event => {
-            if (!event.dataTransfer.types.includes("Files")) return;
-            event.preventDefault();
-            event.stopPropagation();
-            event.dataTransfer.dropEffect = "copy";
-            dropZone.classList.add("hsd-drop");
-        };
-        dropZone.ondragleave = () => dropZone.classList.remove("hsd-drop");
-        dropZone.ondrop = event => {
-            if (!event.dataTransfer.types.includes("Files")) return;
-            event.preventDefault();
-            event.stopPropagation();
-            dropZone.classList.remove("hsd-drop");
-            this.addImages(Array.from(event.dataTransfer.files));
-        };
-        inspector.append(dropZone, upload);
+        this.referenceUpload(inspector, generation === "REF");
         const options = kind => this.assets.filter(asset => (asset.kind ?? "image") === kind).map(asset => [asset.id, asset.name]);
         const automatic = generation === "legacy" ? "None" : "Automatic";
         const imageOptions = options("image");
@@ -802,7 +1053,7 @@ class Editor {
             const row = el("div", "hsd-asset");
             const image = el("img");
             image.alt = "";
-            image.src = api.apiURL(PREFIX + "/assets/" + id);
+            image.src = this.assetUrl(id);
             row.append(image, el("span", "", `<Picture ${index + 1 + Number(prependTail)}> · ${name}`),
                 button("↑", () => {
                     if (!index) return;
@@ -851,23 +1102,84 @@ class Editor {
         }
         inputField(inspector, "Reference image size", [["match", "Match generation canvas"], ["max", "Maximum native detail"]],
             current.ref_image_size ?? "match", value => updateMedia("ref_image_size", value));
-        const slots = referenceSlots(compiler, scene, pass, this.assets, false);
+        const slots = this.slotsFor(scene, pass);
         if (slots.length) inspector.append(el("p", "hsd-note", slots.map(slot => `${slot.tag} ${slot.source}`).join(" · ")));
         else inspector.append(el("p", "hsd-note", "Reference mode needs at least one image, video or audio source."));
     }
 
+    referenceUpload(inspector, acceptsAV) {
+        if (this.options.reference_scopes) {
+            inputField(inspector, "Add references to", [["project", "This project"], ["shared", "All projects"]], this.uploadScope,
+                value => { this.uploadScope = value; });
+        }
+        const upload = el("input", "hsd-file");
+        upload.type = "file";
+        upload.accept = STILL_TYPES + (acceptsAV ? ",.mp4,.mov,.mkv,.webm,.wav,.mp3,.flac,.m4a,.ogg" : "");
+        upload.multiple = true;
+        upload.onchange = () => {
+            const files = Array.from(upload.files);
+            upload.value = "";
+            this.addImages(files);
+        };
+        const dropZone = button(acceptsAV ? "Drop images, video or audio here or browse" : "Drop images here or browse",
+            () => upload.click(), "hsd-image-drop");
+        bindFileDrop(dropZone, files => this.addImages(files));
+        inspector.append(dropZone, upload);
+    }
+
+    libraryInspector(inspector) {
+        inspector.append(el("h3", "", "Reference library"));
+        this.referenceUpload(inspector, true);
+        inputField(inspector, "Show references", [["available", "Available in this project"], ["project", "Project only"],
+            ["shared", "Shared with all projects"]], this.libraryFilter, value => {
+            this.libraryFilter = value;
+            this.renderInspector();
+        });
+        const assets = this.assets.filter(asset => this.libraryFilter === "available" ||
+            Boolean(asset.project_id) === (this.libraryFilter === "project"));
+        const list = el("div", "hsd-assets hsd-library-list");
+        for (const asset of assets) {
+            const row = el("div", "hsd-asset hsd-library-row");
+            const info = el("div", "hsd-library-name");
+            info.append(el("strong", "", asset.name), el("small", "", `${asset.kind} · ${asset.project_id ? "This project" : "All projects"}`));
+            row.append(info, button(this.libraryPreview === asset.id ? "Hide preview" : "Preview", () => {
+                this.libraryPreview = this.libraryPreview === asset.id ? null : asset.id;
+                this.renderInspector();
+            }));
+            if (asset.project_id) row.append(button("Share with all projects", () => this.perform(async () => {
+                await request(this.assetRoute(`/assets/${asset.id}/share`), { method: "PUT" });
+                await this.readAssets();
+                this.renderInspector();
+                this.notice("Reference shared with all projects");
+            })));
+            list.append(row);
+        }
+        inspector.append(list);
+        if (!assets.length) inspector.append(el("p", "hsd-note", "No references in this library view."));
+        const selected = assets.find(asset => asset.id === this.libraryPreview);
+        if (selected) {
+            const preview = el(selected.kind === "image" ? "img" : selected.kind, "hsd-library-preview");
+            if (selected.kind === "image") preview.alt = selected.name;
+            else { preview.controls = true; preview.preload = "metadata"; }
+            preview.src = this.assetUrl(selected.id);
+            inspector.append(preview);
+        }
+    }
+
     async addImages(files) {
         if (!files.length) return;
+        const project = this.project.id;
+        const destination = this.uploadScope === "project" ? project : null;
         await this.perform(async () => {
             let added = 0;
             try {
                 this.notice("Uploading reference media…");
                 for (const file of files) {
-                    await this.uploadAsset(file, file.name);
+                    await this.uploadAsset(file, file.name, destination);
                     added++;
                 }
             } finally {
-                if (added) {
+                if (added && this.project.id === project) {
                     await this.readAssets();
                     this.renderInspector();
                 }
@@ -876,12 +1188,48 @@ class Editor {
         });
     }
 
-    async readAssets() { this.assets = await request("/assets"); }
+    async assignFirstFrame(files) {
+        if (!files.length) return;
+        const [file] = files;
+        if (files.length !== 1 || (!STILL_TYPES.split(",").includes(file.type) && !/\.(png|jpe?g|webp)$/i.test(file.name))) {
+            return this.notice("Choose one PNG, JPEG or WebP image for the first frame.", true);
+        }
+        const { project, scene, activePass: pass } = this;
+        if (this.firstFrameUploads.has(pass)) return;
+        this.firstFrameUploads.add(pass);
+        try {
+            await this.perform(async () => {
+                this.notice("Uploading first frame…");
+                const asset = await this.uploadAsset(file, file.name, project.id);
+                if (asset.kind !== "image") throw new Error("The first frame needs a still image.");
+                if (this.project.id === project.id || !asset.project_id) this.assets.push(asset);
+                if (!this.dialog.open || this.project !== project || !project.scenes.includes(scene) ||
+                    !scene.passes.includes(pass) || !["I2VA", "FL2VA"].includes(generationOf(scene, pass))) return;
+                this.editReferenceOrder(() => { (pass.media ??= {}).first_frame = asset.id; });
+                this.mutate(true);
+                this.notice(`First frame assigned to ${scene.title} · Pass ${scene.passes.indexOf(pass) + 1}`);
+            });
+        } finally {
+            this.firstFrameUploads.delete(pass);
+        }
+    }
 
-    async uploadAsset(file, name) {
+    assetRoute(path, projectId = this.project.id) {
+        return this.options.reference_scopes && projectId ? `${path}?project_id=${encodeURIComponent(projectId)}` : path;
+    }
+
+    assetUrl(id) { return api.apiURL(PREFIX + this.assetRoute("/assets/" + id)); }
+
+    async readAssets() {
+        const projectId = this.project.id;
+        const assets = await request(this.assetRoute("/assets", projectId));
+        if (this.project.id === projectId) this.assets = assets;
+    }
+
+    async uploadAsset(file, name, projectId) {
         const payload = new FormData();
         payload.append("image", file, name);
-        return request("/assets", { method: "POST", body: payload });
+        return request(this.assetRoute("/assets", projectId ?? null), { method: "POST", body: payload });
     }
 
     media(token, type) { return api.apiURL(`${PREFIX}/media/${this.project.id}/${token}/${type}`); }
@@ -949,7 +1297,7 @@ class Editor {
     showPreview(value) {
         this.previewToken = value;
         this.saveVideoButton.hidden = !value || !this.options.save_preview;
-        const video = $(this.dialog, "video");
+        const video = $(this.dialog, "[data-rendered-panel] video");
         const empty = $(this.dialog, "[data-preview-empty]");
         video.hidden = !value;
         empty.hidden = !!value;
@@ -984,6 +1332,23 @@ class Editor {
         this.saveVideoButton.disabled = this.saving || !!this.saveQueueId;
         this.previewControls.forEach(input => { input.disabled = running; });
         $(this.dialog, "progress").value = state.total ? (state.completed + (this.fractional || 0)) / state.total : 0;
+        const eta = $(this.dialog, "[data-render-eta]");
+        eta.hidden = !running;
+        if (running) {
+            const seconds = estimateRenderSeconds(state, this.etaProgress);
+            let label = "Estimating";
+            if (seconds !== null) {
+                const rounded = Math.ceil(seconds);
+                label = `~${rounded >= 60 ? `${Math.floor(rounded / 60)}m ` : ""}${rounded % 60}s`;
+            } else if (!activePhases.has(phase)) {
+                label = "Waiting in queue";
+            } else if (state.total > 0 && state.completed === state.total) {
+                label = "Finishing export";
+            } else if (phase === "decoding" || phase === "saving") {
+                label = "Finishing pass";
+            }
+            eta.textContent = `Render ETA · ${label}`;
+        }
         if (!this.message) {
             const scene = this.project.scenes.find(scene => scene.id === state.scene);
             const label = (state.queued && !activePhases.has(phase)) ? "Queued" : state.error || phaseLabel[phase] || (this.queueId ? "Queued" : "Ready");
@@ -999,8 +1364,12 @@ class Editor {
         if (id !== this.project.id || !this.dialog.open) return;
         const changed = JSON.stringify(state) !== JSON.stringify(this.status);
         if (changed) {
+            if (state.prompt_id !== this.status.prompt_id || state.phase_started_at !== this.status.phase_started_at ||
+                state.scene !== this.status.scene || state.pass_index !== this.status.pass_index) {
+                this.fractional = 0;
+                this.etaProgress = null;
+            }
             this.status = state;
-            this.fractional = 0;
             this.message = null;
             if (state.phase === "complete" && this.monitor.completed !== state.prompt_id) {
                 const result = state.result_preview;
@@ -1122,6 +1491,13 @@ class Editor {
 
     setProject(project) {
         this.project = withDefaults(project, this.options);
+        this.assets = [];
+        this.uploadScope = "project";
+        this.libraryFilter = "available";
+        this.libraryPreview = null;
+        this.history.reset();
+        this.etaProgress = null;
+        this.fractional = 0;
         this.status = {};
         this.message = null;
         this.queueId = null;
@@ -1130,7 +1506,7 @@ class Editor {
         this.renderLiveSettings();
         this.commit();
         this.select(project.scenes[0].id);
-        return this.refresh();
+        return Promise.all([this.refresh(), this.readAssets()]).then(() => this.renderInspector());
     }
 
     async newProject() {
@@ -1165,7 +1541,7 @@ class Editor {
             const project = stored.project ?? stored;
             if (project.version !== 1 || !/^[a-f0-9]{32}$/.test(project.id) || !project.scenes?.length ||
                 project.scenes.some(scene => !scene.passes?.length)) throw new Error("Select a valid Director project JSON.");
-            const existing = new Set(this.assets.map(asset => asset.id));
+            const existing = new Set((await request(this.assetRoute("/assets", project.id))).map(asset => asset.id));
             const mapped = new Map();
             for (const [id, asset] of Object.entries(stored.assets || {})) {
                 if (existing.has(id)) continue;
@@ -1173,22 +1549,23 @@ class Editor {
                     throw new Error("The project contains an invalid reference.");
                 }
                 const blob = await (await fetch(asset.data)).blob();
-                mapped.set(id, (await this.uploadAsset(blob, asset.name)).id);
+                mapped.set(id, (await this.uploadAsset(blob, asset.name, project.id)).id);
             }
             remapAssets(project, mapped);
             await request("/validate", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(project) });
-            await this.readAssets();
             await this.setProject(project);
         });
         input.click();
     }
 
     async exportProject() {
-        const ids = assetIds(this.project);
+        const project = this.project;
+        const library = this.assets;
+        const ids = assetIds(project);
         const assets = {};
         for (const id of ids) {
-            const response = await api.fetchApi(PREFIX + "/assets/" + id);
-            if (!response.ok) throw new Error("A referenced image is missing from the library.");
+            const response = await api.fetchApi(PREFIX + this.assetRoute("/assets/" + id, project.id));
+            if (!response.ok) throw new Error("A referenced file is missing from the library.");
             const file = await response.blob();
             const data = await new Promise((resolve, reject) => {
                 const reader = new FileReader();
@@ -1196,12 +1573,12 @@ class Editor {
                 reader.onerror = reject;
                 reader.readAsDataURL(file);
             });
-            assets[id] = { name: this.assets.find(asset => asset.id === id)?.name ?? id, data };
+            assets[id] = { name: library.find(asset => asset.id === id)?.name ?? id, data };
         }
-        const url = URL.createObjectURL(new Blob([JSON.stringify({ project: this.project, assets }, null, 2)], { type: "application/json" }));
+        const url = URL.createObjectURL(new Blob([JSON.stringify({ project, assets }, null, 2)], { type: "application/json" }));
         const link = el("a");
         link.href = url;
-        link.download = (this.project.name || "H3 SPEED project") + ".json";
+        link.download = (project.name || "H3 SPEED project") + ".json";
         link.click();
         setTimeout(() => URL.revokeObjectURL(url), 1000);
     }

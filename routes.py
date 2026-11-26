@@ -17,7 +17,7 @@ from server import PromptServer
 from . import fantastic
 from .live_preview import available as live_preview_available
 from .project import ASSET, AUDIO_ASSET, ID, LIVE_PREVIEW_LIMITS, TOKEN, VIDEO_ASSET, default_project, validate_project
-from .storage import NODE_TYPE, SESSION, asset_path, project_root, read_json, render_location, root, write_json
+from .storage import NODE_TYPE, SESSION, asset_metadata_path, asset_path, asset_visible, project_root, read_json, render_location, root, write_json
 
 API = "/h3-speed-director"
 CONTAINERS = {"mp4": "mov", "mov": "mov", "mkv": "matroska", "webm": "matroska",
@@ -43,6 +43,7 @@ def register_routes():
             "fantastic": fantastic.BUILDER in nodes.NODE_CLASS_MAPPINGS,
             "save_preview": True,
             "boundary_thumbnails": True,
+            "reference_scopes": True,
             "live_preview": {"available": live_preview_available(), "limits": LIVE_PREVIEW_LIMITS},
         })
 
@@ -124,16 +125,18 @@ def register_routes():
 
     @routes.get(API + "/assets")
     async def get_assets(request):
+        project_id = asset_project(request)
         out = []
         directory = root() / "assets"
         for path in directory.glob("*.json"):
             value = read_json(path)
-            if value and known_asset(value.get("id", "")) and asset_path(value["id"]).is_file():
+            if value and asset_visible(value, project_id) and known_asset(value.get("id", "")) and asset_path(value["id"]).is_file():
                 out.append({"kind": "image"} | value)
         return web.json_response(sorted(out, key=lambda entry: entry["name"].casefold()))
 
     @routes.post(API + "/assets")
     async def add_asset(request):
+        project_id = asset_project(request)
         reader = await request.multipart()
         part = await reader.next()
         if part is None or part.name != "image" or not part.filename:
@@ -175,16 +178,32 @@ def register_routes():
                 raise web.HTTPBadRequest(text=f"Invalid reference file: {error}")
             asset_id = f"{token}.{suffix}"
             temporary.rename(asset_path(asset_id))
-            value.update(id=asset_id, name=name[:150])
-            write_json(root() / "assets" / f"{asset_id}.json", value)
+            value.update(id=asset_id, name=name[:150], project_id=project_id)
+            write_json(asset_metadata_path(asset_id), value)
             return web.json_response(value)
 
     @routes.get(API + "/assets/{asset}")
     async def get_asset(request):
         asset = request.match_info["asset"]
-        if not known_asset(asset):
+        project_id = asset_project(request)
+        if not known_asset(asset) or not asset_visible(read_json(asset_metadata_path(asset), {}), project_id):
             raise web.HTTPNotFound()
         return static_file(asset_path(asset))
+
+    @routes.put(API + "/assets/{asset}/share")
+    async def share_asset(request):
+        asset = request.match_info["asset"]
+        project_id = asset_project(request)
+        if not project_id or not known_asset(asset):
+            raise web.HTTPNotFound()
+        path = asset_metadata_path(asset)
+        value = read_json(path, {})
+        if not value or not asset_visible(value, project_id) or not asset_path(asset).is_file():
+            raise web.HTTPNotFound()
+        if value.get("project_id") is not None:
+            value["project_id"] = None
+            write_json(path, value)
+        return web.json_response(value)
 
     @routes.get(API + "/media/{project_id}/{token}/{asset}")
     async def get_media(request):
@@ -200,6 +219,13 @@ def register_routes():
                 raise web.HTTPNotFound() from None
             return web.Response(body=data, content_type="image/jpeg", headers=CACHE_HEADER)
         return static_file(path)
+
+
+def asset_project(request):
+    project_id = request.query.get("project_id")
+    if project_id is not None and not ID.fullmatch(project_id):
+        raise web.HTTPBadRequest(text="Invalid reference project ID")
+    return project_id
 
 
 def owns_project(item, project_id):

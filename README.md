@@ -28,6 +28,10 @@ Generation keys account for the model graph and model files, effective pass sett
 | Projects | Save and reopen local projects. Import or export JSON, optionally with the referenced media. Drop media into the References panel. |
 | Delivery | Compose the final project canvas, set output FPS and export a synchronized MP4. Optional RIFE interpolation and NVIDIA RTX super resolution use installed dependencies. |
 
+### Prompt editing and references
+
+Type `<` for assigned references and compatible uploads from the project or shared library. **Insert Dialogue** and **Insert Shot** place editable H3 syntax at the caret. Use **Ctrl+Z** and **Ctrl+Y** to undo and redo project edits. The footer shows an estimated render time once sampling provides enough progress. [Prompt tools and reference scopes](docs/USER_GUIDE.md#prompt-editing-and-references).
+
 ### Live sampling preview
 
 Enable **Live Preview** before queueing a render. The monitor shows sampled frames and graphs for sigma and step time, then switches to the completed result. Max image edge, JPEG quality, frame count and playback FPS are adjustable. KJNodes and `taeh3.safetensors` provide the tiny CPU decoder for H3. Previews default to off. On the tested 16 GB system, enabling previews at the default settings averaged **138 s** per render versus **102 s** with previews off. Peak PyTorch sampling allocations matched, and sampled device-wide VRAM was roughly **200 MiB** higher. [Benchmark settings and all trials](docs/BENCHMARKS.md#live-preview).

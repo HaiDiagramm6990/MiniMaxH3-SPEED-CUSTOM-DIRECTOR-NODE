@@ -50,3 +50,7 @@ The validated end-to-end generation run reached 70.208 s of finished video. The 
 ### v1.0.0 release checks
 
 The clean package ran all five modes on the same hardware in 184.43 s. Targeted regeneration produced one new checkpoint and full-film replay reused all five. Cancelling an added pass preserved the five completed checkpoints and resuming generated only the missing pass. A separate 640×640 Automatic SPEED run sampled 22 frames over four stages, emitted eight step events and eight JPEG updates, and completed in 36.70 s on the warm process. The older 22-frame project reopened from its original serialized settings and reused its existing checkpoint. The separate Save Video export contained 148 frames with the extended film’s stereo audio. Thirteen automated schema tests, JavaScript syntax checks, the reference file-drop regression and the install dry run passed. The tested upstream custom-node checkouts were clean.
+
+### v1.1.0 release checks
+
+Browser tests covered autocomplete, direct library assignment, citation changes after reordering and removal, both builders at the caret, and one-step Undo and Redo. A 90-frame Manual SPEED REF render completed with two pictures, a reference video with sound, compound-speaker dialogue, and a timed shot transition. Replaying the same prompt reused the checkpoint. A description edit generated a new checkpoint. The final file contained 90 frames at 24 fps and 3.75 seconds of 48 kHz audio. The existing project schema tests, JavaScript prompt syntax tests, and image-drop regression passed.

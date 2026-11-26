@@ -4,8 +4,8 @@
 
 1. Open the Director from its ComfyUI node. Under **Project settings**, choose the canvas, global descriptions and a generation preset that already works with your H3 checkpoint. The supplied example uses a small canvas and a two-stage Manual SPEED schedule for initial checks.
 2. Select **Scene 1**. Name the scene, choose the generation mode and enter a prompt. The scene default applies to each pass without its own duration override. Select a pass and edit **Pass duration (seconds)** to give it a different length. The app displays the snapped H3 duration.
-3. For image or reference modes, open **References**. Drop your files into the drop zone, then assign them to the correct slots. Use **This pass** to override the scene’s media. The first-frame card identifies uploaded, connected and previously rendered continuity images. A connected `Load Image` node can provide the first project shot’s input.
-4. Click **Render / resume film**. Choose the full film, a scene or a segment in **Rendered Video**. Turn on **Live Preview** before queueing if you want to monitor intermediate frames. It shows the current scene, pass, step, sigma and callback wall time. The first step of a stage includes stage setup.
+3. For image or reference modes, open **References**. Drop your files into the drop zone, then assign them to the correct slots. Use **This pass** to override the scene’s media. Drop an image directly on the **First frame** card for I2VA and FL2VA. The card also identifies connected and previously rendered continuity images. A connected `Load Image` node can provide the first project shot’s input.
+4. Click **Render / resume film**. Choose the full film, a scene or a segment in **Rendered Video**. Turn on **Live Preview** before queueing if you want to monitor intermediate frames. It shows the current scene, pass, step, sigma and callback wall time. The first step of a stage includes stage setup. The footer estimates remaining render time with live preview on or off. **Auto memory cleanup** in Project settings releases unused memory after each generated pass and when the job ends.
 
 ## Choose a mode
 
@@ -18,6 +18,13 @@
 | **REF** | Ordered stills, videos and audio. Tags in the Fantastic editor follow slot order. A video soundtrack can be paired, muted or placed in a standalone audio slot. |
 
 The local Fantastic builder formats structured prompts and adapts the controls and reference requirements. It synchronizes the prompt’s duration to the H3 frame grid. The connected model, sampler, scheduler and sigma shifts remain your generation preset. The **Director · existing behavior** mode opens older projects and supports simple prompts.
+
+## Prompt editing and references
+
+- Type `<` to see references assigned to the current pass and compatible assets from the Reference Library. Filter by name or token. Use the arrow keys, Enter or Tab, or click a row. Escape dismisses the list. Hover over a highlighted token to preview its media. Removing an asset flags its citations. Reordering updates citation numbers while keeping their asset identities.
+- Fantastic uses `<Subject 1>`, `<Picture 1>`, `<Video 1>`, and `<Audio 1>`. Define subjects in REF’s **Subject definitions** section. Use the **Reference library** to add images, video, or audio to **This project** or **All projects**. Older library uploads appear as shared.
+- Place the cursor in a pass description and choose **Insert Dialogue** or **Insert Shot**. Dialogue supports stable voice IDs such as `(S1)` and `(S1,S2)`, plus assigned audio retention in REF. To continue a line across a cut, insert its outgoing and incoming parts on either side. Shot 1 begins at zero without a timestamp. Later cuts snap to the nearest native 24 fps frame and must fit within the pass.
+- Undo or redo with **Ctrl+Z** and **Ctrl+Y**, or use the toolbar. Each builder insertion is one edit. Switching projects starts a fresh editing history.
 
 ## Continue, revise and recover
 

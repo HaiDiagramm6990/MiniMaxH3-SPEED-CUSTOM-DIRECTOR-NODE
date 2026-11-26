@@ -148,13 +148,18 @@ def validate_media(raw):
 
 
 def validate_project(project):
-    fields(project, ("version", "id", "name", "character", "environment", "style", "settings", "delivery", "live_preview", "scenes"), "Project")
+    fields(project, ("version", "id", "name", "character", "environment", "style", "settings", "delivery", "live_preview", "auto_cleanup", "scenes", "speakers"), "Project")
     if type(project.get("version")) is not int or project["version"] != 1:
         raise ValueError("Project version must be 1")
     identifier(project.get("id"), "Project ID")
     text(project.get("name", ""), "Project name", 120)
     for key in ("character", "environment", "style"):
         text(project.get(key, ""), key)
+    speakers = project.get("speakers", {})
+    if not isinstance(speakers, dict) or any(not re.fullmatch(r"S[1-9][0-9]*", key) for key in speakers):
+        raise ValueError("Speaker IDs must have the form S1 or S2")
+    for name in speakers.values():
+        text(name, "Speaker name", 120)
     settings = validate_settings(DEFAULTS | fields(project.get("settings", {}), DEFAULTS, "Project settings"))
     delivery = DELIVERY | fields(project.get("delivery", {}), DELIVERY, "Delivery")
     number(delivery["fps"], 24, 120, "Delivery FPS", integer=True)
@@ -164,6 +169,7 @@ def validate_project(project):
         raise ValueError("Set delivery FPS above 24 to use RIFE")
     number(delivery["rtx_scale"], 1, 4, "RTX scale")
     choice(delivery["rtx_quality"], ("LOW", "MEDIUM", "HIGH", "ULTRA"), "RTX quality")
+    auto_cleanup = boolean(project.get("auto_cleanup", True), "Auto memory cleanup")
     preview = LIVE_PREVIEW | fields(project.get("live_preview", {}), LIVE_PREVIEW, "Live preview")
     boolean(preview["enabled"], "Live preview")
     for key, (minimum, maximum) in LIVE_PREVIEW_LIMITS.items():
@@ -237,14 +243,15 @@ def validate_project(project):
                            "generation": generation, "media": media, "builder": builder})
         checked_scenes.append(scene | checked_media | {"title": title, "transition": transition, "previous_reference": previous,
                                                        "references": refs, "passes": passes})
-    return project | {"settings": settings, "delivery": delivery, "live_preview": preview, "scenes": checked_scenes}
+    return project | {"settings": settings, "delivery": delivery, "live_preview": preview,
+                      "auto_cleanup": auto_cleanup, "scenes": checked_scenes}
 
 
 def default_project():
     return {
         "version": 1, "id": uuid.uuid4().hex, "name": "Untitled film",
         "character": "", "environment": "", "style": "", "settings": DEFAULTS.copy(),
-        "delivery": DELIVERY.copy(), "live_preview": LIVE_PREVIEW.copy(),
+        "delivery": DELIVERY.copy(), "live_preview": LIVE_PREVIEW.copy(), "auto_cleanup": True,
         "scenes": [{"id": uuid.uuid4().hex, "title": "Scene 1", "transition": "cut",
                     "passes": [{"id": uuid.uuid4().hex, "mode": "generate", "prompt": "", "overrides": {}}],
                     "overrides": {}, "references": []}],

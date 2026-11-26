@@ -19,6 +19,10 @@ A pass key includes the effective generation settings and seed, prompts, role, i
 
 Delivery keys use the ordered segment identities and delivery settings. A delivery-only change can reassemble from the existing generation checkpoints and reprocess just the delivery artifacts it needs. Preview settings are display options and do not enter generation keys. The **Send to Save Video** action queues the selected render as a file-backed video input to ComfyUI’s Save Video node.
 
+## Prompt editing
+
+The editor uses the installed Fantastic language list, audio-retention markers, composer and validator. During media order edits it tracks each slot by its library asset or continuity source and updates positional citations across affected passes. The updated prompt and conditioning inputs feed the existing generation cache. Project speaker names are editor metadata. Undo and redo record project edits as snapshots.
+
 ## Timing and performance
 
 H3 samples at **24 fps** on a `17k + 5` frame grid, up to **362 frames per pass**. Continuity trimming removes the duplicated leading video frame and its corresponding audio samples when applicable. Output delivery derives clip lengths from retained frames, fits stereo waveform duration to the video clock and streams assembly from disk. Sampling and full VAE decode still need working memory for an entire pass.
